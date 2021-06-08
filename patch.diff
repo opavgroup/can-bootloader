@@ -1,0 +1,502 @@
+diff --git a/bootloader.c b/bootloader.c
+index b3dee6d..c65ffa0 100644
+--- a/bootloader.c
++++ b/bootloader.c
+@@ -69,6 +69,8 @@ static void return_datagram(uint8_t source_id, uint8_t dest_id, uint8_t *data, s
+ void bootloader_main(int arg)
+ {
+     bool timeout_active = !(arg == BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT);
++    // arg == 0 -> true  -> BOOT_ARG_START_BOOTLOADER + power up
++    // arg == 1 -> false -> BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT
+ 
+     bootloader_config_t config;
+     if (config_is_valid(memory_get_config1_addr(), CONFIG_PAGE_SIZE)) {
+@@ -78,13 +80,24 @@ void bootloader_main(int arg)
+     } else {
+         // exact behaviour at invalid config is not yet defined.
+         strcpy(config.device_class, PLATFORM_DEVICE_CLASS);
+-        strcpy(config.board_name, "foobar2000");
++        strcpy(config.board_name, "BCU");
+         config.ID = DEFAULT_ID;
+         config.application_crc = 0xDEADC0DE;
+         config.application_size = 0;
+         config.update_count = 1;
+     }
+ 
++    if(!timeout_active)
++    // from the bcu_scripting + when CRC fails
++    {
++        ; // continue
++    }
++    else
++    // power up ( + command jump to application, but this never reaches the bootloader )
++    {
++        command_jump_to_application(0, NULL, NULL, &config);
++    }
++
+     can_datagram_t dt;
+     can_datagram_init(&dt);
+     can_datagram_set_address_buffer(&dt, addr_buf);
+@@ -95,9 +108,10 @@ void bootloader_main(int arg)
+     uint32_t id;
+     uint8_t len;
+     while (true) {
+-        if (timeout_active && timeout_reached()) {
+-            command_jump_to_application(0, NULL, NULL, &config);
+-        }
++// We stay in the bootloader until the command_jump_to_application command is received
++//        if (timeout_active && timeout_reached()) {
++//            command_jump_to_application(0, NULL, NULL, &config);
++//        }
+ 
+         if (!can_interface_read_message(&id, data, &len, CAN_RECEIVE_TIMEOUT)) {
+             continue;
+diff --git a/client/can/__init__.py b/client/can/__init__.py
+deleted file mode 100644
+index b4140b7..0000000
+--- a/client/can/__init__.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-from .datagram import *
+-from .frame import *
+diff --git a/client/can/adapters.py b/client/can/adapters.py
+deleted file mode 100644
+index 2ca21dd..0000000
+--- a/client/can/adapters.py
++++ /dev/null
+@@ -1,139 +0,0 @@
+-import can
+-import socket
+-import struct
+-import serial
+-from queue import Queue
+-import threading
+-
+-class SocketCANConnection:
+-    # See <linux/can.h> for format
+-    CAN_FRAME_FMT = "=IB3x8s"
+-    CAN_FRAME_SIZE = struct.calcsize(CAN_FRAME_FMT)
+-
+-
+-    def __init__(self, interface):
+-        """
+-        Initiates a CAN connection on the given interface (e.g. 'can0').
+-        """
+-        # Creates a raw CAN connection and binds it to the given interface.
+-        self.socket = socket.socket(socket.AF_CAN,
+-                                    socket.SOCK_RAW,
+-                                    socket.CAN_RAW)
+-
+-        self.socket.bind((interface, ))
+-        self.socket.settimeout(1.)
+-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+-
+-    def send_frame(self, frame):
+-        data = frame.data.ljust(8, b'\x00')
+-        data = struct.pack(self.CAN_FRAME_FMT,
+-                           frame.id,
+-                           len(frame.data),
+-                           data)
+-
+-        self.socket.send(data)
+-
+-    def receive_frame(self):
+-        try:
+-            frame, _ = self.socket.recvfrom(self.CAN_FRAME_SIZE)
+-        except socket.timeout:
+-            return None
+-        can_id, can_dlc, data = struct.unpack(self.CAN_FRAME_FMT, frame)
+-
+-        return can.Frame(id=can_id, data=data[:can_dlc])
+-
+-class SerialCANConnection:
+-    """
+-    Implements the slcan API.
+-    """
+-
+-    MIN_MSG_LEN = len('t1230')
+-
+-    def __init__(self, port):
+-        self.port = port
+-
+-        self.rx_queue = Queue()
+-        t = threading.Thread(target=self.spin)
+-        t.daemon = True
+-        t.start()
+-
+-        self.send_command('S8'); # bitrate 1Mbit
+-        self.send_command('O'); # open device
+-        port.reset_input_buffer()
+-
+-    def spin(self):
+-        part = ''
+-        while True:
+-            part += self.port.read(100).decode('ascii')
+-
+-            if part.startswith('\r'):
+-                part.lstrip('\r')
+-
+-            if '\r' not in part:
+-                continue
+-
+-            data = part.split('\r')
+-            data, part = data[:-1], data[-1]
+-
+-            for frame in data:
+-                if frame is None:
+-                    continue
+-                frame = self.decode_frame(frame)
+-                if frame:
+-                    self.rx_queue.put(frame)
+-
+-    def send_command(self, cmd):
+-        cmd += '\r'
+-        cmd = cmd.encode('ascii')
+-        self.port.write(cmd)
+-
+-    def decode_frame(self, msg):
+-        if len(msg) < self.MIN_MSG_LEN:
+-            return None
+-
+-        cmd, msg = msg[0], msg[1:]
+-        if cmd == 'T':
+-            extended = True
+-            id_len = 8
+-        elif cmd == 't':
+-            extended = False
+-            id_len = 3
+-        else:
+-            return None
+-
+-        if len(msg) < id_len + 1:
+-            return None
+-        can_id = int(msg[0:id_len], 16)
+-        msg = msg[id_len:]
+-        data_len = int(msg[0])
+-        msg = msg[1:]
+-        if len(msg) < 2 * data_len:
+-            return None
+-        data = [int(msg[i:i+2], 16) for i in range(0, 2 * data_len, 2)]
+-
+-        return can.Frame(id=can_id, data=bytearray(data), data_length=data_len, extended=extended)
+-
+-    def encode_frame(self, frame):
+-        if frame.extended:
+-            cmd = 'T'
+-            can_id = '{:08x}'.format(frame.id)
+-        else:
+-            cmd = 't'
+-            can_id = '{:03x}'.format(frame.id)
+-
+-        length = '{:x}'.format(frame.data_length)
+-
+-        data = ''
+-        for b in frame.data:
+-            data += '{:02x}'.format(b)
+-        return cmd + can_id + length + data
+-
+-    def send_frame(self, frame):
+-        cmd = self.encode_frame(frame)
+-        self.send_command(cmd)
+-
+-    def receive_frame(self):
+-        try:
+-            return self.rx_queue.get(True, 1) # block with timeout 1 sec
+-        except:
+-            return None
+diff --git a/client/can/datagram.py b/client/can/datagram.py
+deleted file mode 100644
+index 1b00a17..0000000
+--- a/client/can/datagram.py
++++ /dev/null
+@@ -1,96 +0,0 @@
+-import struct
+-from zlib import crc32
+-from .frame import *
+-
+-DATAGRAM_VERSION = 1
+-START_OF_DATAGRAM_MASK = (1 << 7)
+-
+-class VersionMismatchError(RuntimeError):
+-    """
+-    Error raised when attempting to decode a datagram with the wrong version.
+-    """
+-    pass
+-
+-class CRCMismatchError(RuntimeError):
+-    """
+-    Error raised when attempting to decode a datagram with the wrong CRC.
+-    """
+-    pass
+-
+-def is_start_of_datagram(frame):
+-    """
+-    Returns true if the given frame has the start of datagram marker.
+-    """
+-    return bool(frame.id & START_OF_DATAGRAM_MASK)
+-
+-def encode_datagram(data, destinations):
+-    """
+-    Encodes the given data and destination list to form a complete datagram.
+-    This datagram can then be cut into CAN messages by datagram_to_frames.
+-    """
+-
+-    version = struct.pack('B', DATAGRAM_VERSION)
+-    addresses = bytes([len(destinations)] + destinations)
+-    dt = struct.pack('>I', len(data)) + data
+-    crc = struct.pack('>I', crc32(addresses + dt))
+-
+-    return version + crc + addresses + dt
+-
+-def decode_datagram(data):
+-    """
+-    Decode the given datagram.
+-    Returns a tuple containing the data and the list of destination if the datagram is complete and valid.
+-    Returns None if the datagram is incomplete.
+-
+-    Raise an exception if the datagram is invalid (wrong version or wrong CRC).
+-    """
+-
+-    try:
+-        version, data = int(data[0]), data[1:]
+-        if version != DATAGRAM_VERSION:
+-            raise VersionMismatchError
+-
+-        header_format = '>IB'
+-        header_len = struct.calcsize(header_format)
+-        header, data = data[0:header_len], data[header_len:]
+-        crc, dst_len = struct.unpack(header_format, header)
+-
+-        # Decodes the destination list
+-        destination_format = '{}s'.format(dst_len)
+-        destinations, data = data[:dst_len], data[dst_len:]
+-        destinations = list(struct.unpack(destination_format, destinations)[0])
+-
+-        data_len, data = data[:4], data[4:]
+-        data_len = struct.unpack('>I', data_len)[0]
+-
+-        # If we did not receive all data yet
+-        if data_len != len(data):
+-            return None
+-
+-        addresses = bytes([len(destinations)] + destinations)
+-        dt = struct.pack('>I', len(data)) + data
+-
+-        if crc32(addresses + dt) != crc:
+-            raise CRCMismatchError
+-
+-    except struct.error:
+-        # This means that we have not enough bytes to decode somewhere
+-        return None
+-
+-    return data, destinations
+-
+-def datagram_to_frames(datagram, source):
+-    """
+-    Transforms a raw datagram into CAN frames.
+-    """
+-    start_bit = START_OF_DATAGRAM_MASK
+-
+-    while len(datagram) > 8:
+-        data, datagram = datagram[:8], datagram[8:]
+-
+-        yield Frame(id=start_bit + source, data=data)
+-
+-        start_bit = 0
+-
+-    yield Frame(id=start_bit + source, data=datagram)
+-
+diff --git a/client/can/frame.py b/client/can/frame.py
+deleted file mode 100644
+index 1833bf9..0000000
+--- a/client/can/frame.py
++++ /dev/null
+@@ -1,39 +0,0 @@
+-class Frame:
+-    """
+-    A single CAN frame.
+-    """
+-
+-    def __init__(self, id=0, data=None, extended=False,
+-                 transmission_request=False,
+-                 data_length=0):
+-
+-        if data is None:
+-            data = bytes()
+-
+-        if len(data) > 8:
+-            raise ValueError
+-
+-        self.id = id
+-
+-        self.data = data
+-        self.data_length = data_length
+-
+-        if len(self.data) > 0:
+-            self.data_length = len(self.data)
+-
+-        self.transmission_request = transmission_request
+-        self.extended = extended
+-
+-    def __eq__(self, other):
+-        return self.id == other.id and self.data == other.data
+-
+-    def __str__(self):
+-        if self.extended:
+-            frame = '{:08X}'.format(self.id)
+-        else:
+-            frame = '{:03X}'.format(self.id)
+-        frame += ' [{}]'.format(self.data_length)
+-        if not self.transmission_request:
+-            for b in self.data:
+-                frame += ' {:02X}'.format(int(b));
+-        return frame
+diff --git a/client/cvra_bootloader/utils.py b/client/cvra_bootloader/utils.py
+index 89f9b84..28d5073 100644
+--- a/client/cvra_bootloader/utils.py
++++ b/client/cvra_bootloader/utils.py
+@@ -4,9 +4,9 @@ import argparse
+ import time
+ 
+ from cvra_bootloader import commands
+-import can
++import ccan
+ import logging
+-import can.adapters
++import ccan.adapters
+ 
+ from collections import defaultdict
+ 
+@@ -69,10 +69,10 @@ def open_connection(args):
+     Returns a file like object which will be the connection handle.
+     """
+     if args.can_interface:
+-        return can.adapters.SocketCANConnection(args.can_interface)
++        return ccan.adapters.SocketCANConnection(args.can_interface)
+     elif args.serial_device:
+         port = serial.Serial(port=args.serial_device, timeout=0.1)
+-        return can.adapters.SerialCANConnection(port)
++        return ccan.adapters.SerialCANConnection(port)
+ 
+ def read_can_datagrams(fdesc):
+     buf = defaultdict(lambda: bytes())
+@@ -91,7 +91,7 @@ def read_can_datagrams(fdesc):
+             src = frame.id & (0x7f)
+             buf[src] += frame.data
+ 
+-            datagram = can.decode_datagram(buf[src])
++            datagram = ccan.decode_datagram(buf[src])
+ 
+             if datagram is not None:
+                 del buf[src]
+@@ -122,8 +122,8 @@ def write_command(fdesc, command, destinations, source=0):
+     """
+     Writes the given encoded command to the CAN bridge.
+     """
+-    datagram = can.encode_datagram(command, destinations)
+-    frames = can.datagram_to_frames(datagram, source)
++    datagram = ccan.encode_datagram(command, destinations)
++    frames = ccan.datagram_to_frames(datagram, source)
+ 
+     for frame in frames:
+         fdesc.send_frame(frame)
+diff --git a/client/setup.py b/client/setup.py
+index 83081b3..add0e9a 100644
+--- a/client/setup.py
++++ b/client/setup.py
+@@ -8,7 +8,7 @@ setup(
+     author_email='info@cvra.ch',
+     url='https://github.com/cvra/can-bootloader',
+     license='BSD',
+-    packages=['cvra_bootloader', 'can'],
++    packages=['cvra_bootloader', 'ccan'],
+     classifiers=[
+         'Development Status :: 5 - Production/Stable',
+         'Intended Audience :: Developers',
+diff --git a/command.c b/command.c
+index a186669..ddedf4b 100644
+--- a/command.c
++++ b/command.c
+@@ -113,11 +113,11 @@ void command_read_flash(int argc, cmp_ctx_t *args, cmp_ctx_t *out, bootloader_co
+ 
+ void command_jump_to_application(int argc, cmp_ctx_t *args, cmp_ctx_t *out, bootloader_config_t *config)
+ {
+-    if (crc32(0, memory_get_app_addr(), config->application_size) == config->application_crc) {
++    //if (crc32(0, memory_get_app_addr(), config->application_size) == config->application_crc) {
+         reboot_system(BOOT_ARG_START_APPLICATION);
+-    } else {
+-        reboot_system(BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT);
+-    }
++    //} else {
++    //    reboot_system(BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT);
++   // }
+ }
+ 
+ void command_crc_region(int argc, cmp_ctx_t *args, cmp_ctx_t *out, bootloader_config_t *config)
+diff --git a/platform.h b/platform.h
+deleted file mode 100644
+index 3badf9c..0000000
+--- a/platform.h
++++ /dev/null
+@@ -1,27 +0,0 @@
+-#ifndef PLATFORM_H
+-#define PLATFORM_H
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-#include <stdint.h>
+-#include <stddef.h>
+-
+-// example sizes
+-#define PLATFORM_DEVICE_CLASS "test-device"
+-#define FLASH_PAGE_SIZE 256
+-#define CONFIG_PAGE_SIZE FLASH_PAGE_SIZE
+-
+-extern uint8_t config_page_buffer[CONFIG_PAGE_SIZE];
+-
+-void *memory_get_app_addr(void);
+-void *memory_get_config1_addr(void);
+-void *memory_get_config2_addr(void);
+-size_t memory_get_app_size(void);
+-
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-#endif /* PLATFORM_H */
+diff --git a/platform/mcu/stm32f4/can_interface.c b/platform/mcu/stm32f4/can_interface.c
+index 6aacb66..e47dd00 100644
+--- a/platform/mcu/stm32f4/can_interface.c
++++ b/platform/mcu/stm32f4/can_interface.c
+@@ -1,6 +1,7 @@
+ #include <libopencm3/stm32/can.h>
+ #include <can_interface.h>
+ 
++bool can_interface_send_message(uint32_t id, uint8_t *message, uint8_t length, uint32_t retries);
+ bool can_interface_read_message(uint32_t *id, uint8_t *message, uint8_t *length, uint32_t retries)
+ {
+     uint32_t fid;
+@@ -10,6 +11,8 @@ bool can_interface_read_message(uint32_t *id, uint8_t *message, uint8_t *length,
+     while(retries-- != 0 && (CAN_RF0R(CAN1) & CAN_RF0R_FMP0_MASK) == 0);
+ 
+     if ((CAN_RF0R(CAN1) & CAN_RF0R_FMP0_MASK) == 0) {
++//        uint8_t b[8];
++//        can_interface_send_message(15, b, 5, 10);
+         return false;
+     }
+ 
+@@ -42,7 +45,11 @@ bool can_interface_send_message(uint32_t id, uint8_t *message, uint8_t length, u
+             message     // data
+         );
+ 
+-        while((CAN_TSR(CAN1) & CAN_TSR_RQCP0) == 0);
++        while((CAN_TSR(CAN1) & CAN_TSR_RQCP0) == 0)
++        {
++            if((CAN_TSR(CAN1) & CAN_TSR_ALST0) != 0)
++                break;
++        }
+ 
+         if ((CAN_TSR(CAN1) & CAN_TSR_TXOK0)) {
+             return true;    // can ok

@@ -4,9 +4,9 @@ import argparse
 import time
 
 from cvra_bootloader import commands
-import can
+import ccan
 import logging
-import can.adapters
+import ccan.adapters
 
 from collections import defaultdict
 
@@ -69,10 +69,10 @@ def open_connection(args):
     Returns a file like object which will be the connection handle.
     """
     if args.can_interface:
-        return can.adapters.SocketCANConnection(args.can_interface)
+        return ccan.adapters.SocketCANConnection(args.can_interface)
     elif args.serial_device:
         port = serial.Serial(port=args.serial_device, timeout=0.1)
-        return can.adapters.SerialCANConnection(port)
+        return ccan.adapters.SerialCANConnection(port)
 
 def read_can_datagrams(fdesc):
     buf = defaultdict(lambda: bytes())
@@ -91,7 +91,7 @@ def read_can_datagrams(fdesc):
             src = frame.id & (0x7f)
             buf[src] += frame.data
 
-            datagram = can.decode_datagram(buf[src])
+            datagram = ccan.decode_datagram(buf[src])
 
             if datagram is not None:
                 del buf[src]
@@ -122,8 +122,8 @@ def write_command(fdesc, command, destinations, source=0):
     """
     Writes the given encoded command to the CAN bridge.
     """
-    datagram = can.encode_datagram(command, destinations)
-    frames = can.datagram_to_frames(datagram, source)
+    datagram = ccan.encode_datagram(command, destinations)
+    frames = ccan.datagram_to_frames(datagram, source)
 
     for frame in frames:
         fdesc.send_frame(frame)

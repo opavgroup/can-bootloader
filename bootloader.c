@@ -69,6 +69,8 @@ static void return_datagram(uint8_t source_id, uint8_t dest_id, uint8_t *data, s
 void bootloader_main(int arg)
 {
     bool timeout_active = !(arg == BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT);
+    // arg == 0 -> true  -> BOOT_ARG_START_BOOTLOADER + power up
+    // arg == 1 -> false -> BOOT_ARG_START_BOOTLOADER_NO_TIMEOUT
 
     bootloader_config_t config;
     if (config_is_valid(memory_get_config1_addr(), CONFIG_PAGE_SIZE)) {
@@ -78,11 +80,22 @@ void bootloader_main(int arg)
     } else {
         // exact behaviour at invalid config is not yet defined.
         strcpy(config.device_class, PLATFORM_DEVICE_CLASS);
-        strcpy(config.board_name, "foobar2000");
+        strcpy(config.board_name, "BCU");
         config.ID = DEFAULT_ID;
         config.application_crc = 0xDEADC0DE;
         config.application_size = 0;
         config.update_count = 1;
+    }
+
+    if(!timeout_active)
+    // from the bcu_scripting + when CRC fails
+    {
+        ; // continue
+    }
+    else
+    // power up ( + command jump to application, but this never reaches the bootloader )
+    {
+        command_jump_to_application(0, NULL, NULL, &config);
     }
 
     can_datagram_t dt;
@@ -95,9 +108,10 @@ void bootloader_main(int arg)
     uint32_t id;
     uint8_t len;
     while (true) {
-        if (timeout_active && timeout_reached()) {
-            command_jump_to_application(0, NULL, NULL, &config);
-        }
+// We stay in the bootloader until the command_jump_to_application command is received
+//        if (timeout_active && timeout_reached()) {
+//            command_jump_to_application(0, NULL, NULL, &config);
+//        }
 
         if (!can_interface_read_message(&id, data, &len, CAN_RECEIVE_TIMEOUT)) {
             continue;

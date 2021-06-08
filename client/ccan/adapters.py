@@ -1,4 +1,4 @@
-import can
+import ccan
 import socket
 import struct
 import serial
@@ -40,7 +40,7 @@ class SocketCANConnection:
             return None
         can_id, can_dlc, data = struct.unpack(self.CAN_FRAME_FMT, frame)
 
-        return can.Frame(id=can_id, data=data[:can_dlc])
+        return ccan.Frame(id=can_id, data=data[:can_dlc])
 
 class SerialCANConnection:
     """
@@ -111,7 +111,7 @@ class SerialCANConnection:
             return None
         data = [int(msg[i:i+2], 16) for i in range(0, 2 * data_len, 2)]
 
-        return can.Frame(id=can_id, data=bytearray(data), data_length=data_len, extended=extended)
+        return ccan.Frame(id=can_id, data=bytearray(data), data_length=data_len, extended=extended)
 
     def encode_frame(self, frame):
         if frame.extended:
